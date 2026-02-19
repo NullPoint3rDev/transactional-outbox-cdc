@@ -95,7 +95,7 @@ flowchart LR
 ### Run the full stack
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/transactional-outbox-cdc.git
+git clone https://github.com/NullPoint3rDev/transactional-outbox-cdc.git
 cd transactional-outbox-cdc
 docker compose up -d --build
 ```
