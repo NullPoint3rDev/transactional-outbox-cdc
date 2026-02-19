@@ -1,0 +1,13 @@
+build/
+!gradle/wrapper/gradle-wrapper.jar
+.gradle/
+.idea/
+*.iml
+.git/
+.gitignore
+*.md
+bin/
+out/
+order-service/build/
+order-consumer/build/
+outbox-events/build/

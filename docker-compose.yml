@@ -1,0 +1,161 @@
+# Transactional Outbox + CDC — full stack
+# Run: docker compose up -d --build
+# API: http://localhost:8080  |  Grafana: http://localhost:3000 (admin/admin)  |  Prometheus: http://localhost:9090
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: outbox_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    command: ["postgres", "-c", "wal_level=logical"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d outbox_db"]
+      interval: 3s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: apache/kafka:3.7.0
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+
+  connect:
+    image: quay.io/debezium/connect:2.4
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: outbox-connect
+      CONFIG_STORAGE_TOPIC: outbox-connect-configs
+      OFFSET_STORAGE_TOPIC: outbox-connect-offsets
+      STATUS_STORAGE_TOPIC: outbox-connect-status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  register-connector:
+    image: alpine:3.19
+    entrypoint: []
+    command:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache curl jq
+        echo "Waiting for Connect..."
+        until curl -sf http://connect:8083/; do sleep 3; done
+        echo "Connect is up. Waiting 15s for plugins to load..."
+        sleep 15
+        for i in 1 2 3 4 5; do
+          echo "Registering connector (attempt $$i)..."
+          resp=$$(curl -s -w "\n%{http_code}" -X POST -H "Content-Type: application/json" -d @/config/connector.json http://connect:8083/connectors)
+          code=$$(echo "$$resp" | tail -n1)
+          body=$$(echo "$$resp" | sed '$$d')
+          echo "Response ($$code): $$body"
+          case "$$code" in
+            201) echo "Connector created."; exit 0;;
+            409) echo "Connector already exists."; exit 0;;
+            *) echo "Retrying in 5s..."; sleep 5;;
+          esac
+        done
+        echo "Failed to register connector after 5 attempts. Register manually: curl -X POST -H 'Content-Type: application/json' -d @deploy/outbox-connector.json http://localhost:8083/connectors"
+        exit 0
+    volumes:
+      - ./deploy/outbox-connector.json:/config/connector.json:ro
+    depends_on:
+      connect:
+        condition: service_healthy
+    restart: "no"
+
+  order-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.order-service
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/outbox_db
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  order-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.order-consumer
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+      register-connector:
+        condition: service_completed_successfully
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-lifecycle
+      - --storage.tsdb.path=/prometheus
+    depends_on:
+      - order-service
+      - order-consumer
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  grafana_data:
